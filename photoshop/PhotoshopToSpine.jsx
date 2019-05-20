@@ -1,4 +1,4 @@
-﻿#target photoshop
+#target photoshop
 app.bringToFront();
 
 // This script exports Adobe Photoshop layers as individual PNGs. It also
@@ -13,7 +13,7 @@ app.bringToFront();
 //     * Neither the name of Esoteric Software nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-var scriptVersion = 3.3; // This is incremented every time the script is modified, so you know if you have the latest.
+var scriptVersion = 2.0; // This is incremented every time the script is modified, so you know if you have the latest.
 
 var cs2 = parseInt(app.version) < 10;
 
@@ -28,6 +28,7 @@ var defaultSettings = {
 	writeTemplate: false,
 	writeJson: true,
 	trimWhitespace: true,
+	imageSequence: false,
 	scale: 1,
 	padding: 1,
 	imagesDir: "./images/",
@@ -36,9 +37,8 @@ var defaultSettings = {
 var settings = loadSettings();
 showSettingsDialog();
 
-var progress, cancel, errors;
+var progress, cancel;
 function run () {
-	errors = [];
 	showProgressDialog();
 
 	// Output dirs.
@@ -81,11 +81,15 @@ function run () {
 		if (settings.scale != 1) restoreHistory();
 	}
 
-	if (!settings.jsonPath && !settings.imagesDir) return;
+	if (!settings.jsonPath && !settings.imagesDir) {
+		activeDocument.close(SaveOptions.DONOTSAVECHANGES);
+		return;
+	}
 
 	// Rasterize all layers.
 	try {
-		executeAction(sID("rasterizeAll"), undefined, DialogModes.NO);
+
+executeAction(sID("rasterizeAll"), undefined, DialogModes.NO);
 	} catch (ignored) {}
 
 	// Add a history item to prevent layer visibility from changing by the active layer being reset to the top.
@@ -94,46 +98,51 @@ function run () {
 	// Collect and hide layers.
 	var layers = [];
 	collectLayers(activeDocument, layers);
+
 	var layersCount = layers.length;
 
 	// Add a history item to prevent layer visibility from changing by restoreHistory.
 	activeDocument.artLayers.add();
 
 	// Store the bones, slot names, and layers for each skin.
-	var bones = { _root: { name: "root", x: 0, y: 0, children: [] } };
+	var bones = { root: { name: "root", x: 0, y: 0, children: [] } };
 	var slots = {}, slotsCount = 0;
-	var skins = { _default: [] }, skinsCount = 0;
+	var skins = { "default": [] }, skinsCount = 0;
 	var totalLayerCount = 0;
-	outer:
+    var gotAnims = false;
+
+
+
 	for (var i = 0; i < layersCount; i++) {
-		if (cancel) return;
 		var layer = layers[i];
-		if (layer.kind != LayerKind.NORMAL && !isGroup(layer)) continue;
-
-		var name = stripTags(layer.name).replace(/.png$/, "");
-		name = name.replace(/[\x00-\x1f\x80-\x9f\\\/:"*?<>|]/g, "").replace(/^\.+$/, "").replace(/^__drag$/, ""); // Illegal.
-		name = name.replace(/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i, ""); // Windows.
-		if (!name || name.length > 255) {
-			error("Layer name is not a valid attachment name:\n\n" + layer.name);
-			continue;
-		}
-		layer.attachmentName = folders(layer, "") + name;
-
+		if (layer.kind != LayerKind.NORMAL && !group) continue;
+		layer.attachmentName = folders(layer, "") + stripTags(layer.name);
 		var bone = null;
 		var boneLayer = findTagLayer(layer, "bone", null);
 		if (boneLayer) {
+			function getParentBone (boneLayer, bones) {
+				var parentName = findTag(boneLayer.parent, "bone", "root");
+				var parent = bones[parentName];
+				if (!parent) { // Parent bone group with no attachment layers.
+					var parentParent = getParentBone(boneLayer.parent, bones);
+					bones[parentName] = parent = { name: parentName, parent: parentParent, children: [], x: 0, y: 0 };
+					parentParent.children.push(parent);
+				}
+				return parent;
+			}
 			var parent = getParentBone(boneLayer, bones);
+
 			var boneName = stripTags(boneLayer.name);
-			bone = get(bones, boneName);
+			bone = bones[boneName];
 			if (bone) {
 				if (parent != bone.parent) {
-					error("Multiple layers for the \"" + boneName + "\" bone have different parent bones:\n\n"
+					alert("Multiple layers for the \"" + boneName + "\" bone have different parent bones:\n\n"
 						+ bone.parent.name + "\n"
 						+ parent.name);
-					continue;
+					return;
 				}
 			} else {
-				set(bones, boneName, bone = { name: boneName, parent: parent, children: [] });
+				bones[boneName] = bone = { name: boneName, parent: parent, children: [] };
 				parent.children.push(bone);
 			}
 			if (layer.wasVisible) {
@@ -147,76 +156,39 @@ function run () {
 				bone.y -= (activeDocument.height.as("px") - yOffSet) * settings.scale;
 			}
 		}
-
 		layer.slotName = findTag(layer, "slot", layer.attachmentName);
-		if (!get(slots, layer.slotName)) slotsCount++;
-		var slot;
-		set(slots, layer.slotName, slot = { bone: bone, attachment: layer.wasVisible ? layer.attachmentName : null });
+		if (!slots[layer.slotName]) slotsCount++;
+		slots[layer.slotName] = { bone: bone, attachment: layer.wasVisible ? layer.attachmentName : null, childrenCount: layer.parent.layers.length};
+        if (layer.parent.layers.length > 1) gotAnims = true;
 		if (layer.blendMode == BlendMode.LINEARDODGE)
-			slot.blend = "additive";
+			slots[layer.slotName].blend = "additive";
 		else if (layer.blendMode == BlendMode.MULTIPLY)
-			slot.blend = "multiply";
+			slots[layer.slotName].blend = "multiply";
 		else if (layer.blendMode == BlendMode.SCREEN)
-			slot.blend = "screen";
+			slots[layer.slotName].blend = "screen";
 
 		var skinName = findTag(layer, "skin", "default");
-		var skinSlots = get(skins, skinName);
+		var skinSlots = skins[skinName];
 		if (!skinSlots) {
-			set(skins, skinName, skinSlots = {});
+			skins[skinName] = skinSlots = {};
 			skinsCount++;
 		}
 
-		var skinLayers = get(skinSlots, layer.slotName);
-		if (!skinLayers) set(skinSlots, layer.slotName, skinLayers = []);
+		var skinLayers = skinSlots[layer.slotName];
+		if (!skinLayers) skinSlots[layer.slotName] = skinLayers = [];
 		for (var ii = 0, nn = skinLayers.length; ii < nn; ii++) {
 			if (skinLayers[ii].attachmentName == layer.attachmentName) {
-				error("Multiple layers for the \"" + skinName + "\" skin have the same name:\n\n"
+				alert("Multiple layers for the \"" + skinName + "\" skin have the same name:\n\n"
 					+ layer.attachmentName
 					+ "\n\nRename or use the [ignore] tag for the other layers.");
-				continue outer;
+				return;
 			}
 		}
 		skinLayers[skinLayers.length] = layer;
 		totalLayerCount++;
 	}
-
-	var n = errors.length;
-	if (n) {
-		var first = errors[0];
-		var file;
-		if (n > 1) {
-			try {
-				var all = "";
-				for (var i = 0; i < n; i++) {
-					if (i > 0) all += "---\n";
-					all += errors[i].replace(/\n\n/g, "\n") + "\n";
-				}
-				file = new File(jsonFile.parent + "/errors.txt");
-				file.parent.create();
-				file.encoding = "UTF-8";
-				file.remove();
-				file.open("w", "TEXT");
-				file.lineFeed = "\n";
-				file.write(all);
-				file.close();
-				if (n == 2)
-					first += "\n\nSee errors.txt for 1 additional error.";
-				else
-					first += "\n\nSee errors.txt for " + (n - 1) + " additional errors.";
-			} catch (e) {
-				if (n == 2)
-					first += "\n\nUnable to write 1 additional error to errors.text.\n"+e;
-				else
-					first += "\n\nUnable to write " + (n - 1) + " additional errors to errors.txt.\n"+e;
-			}
-		}
-		alert(first);
-		if (file) file.execute();
-		return;
-	}
-
 	// Output skeleton.
-	var json = '{ "skeleton": { "images": "' + imagesDir + '" },\n"bones": [\n';
+	var json = '{\n"skeleton": { "images": "' + imagesDir + '"  },\n"bones": [\n';
 
 	// Output bones.
 	function outputBone (bone) {
@@ -236,7 +208,6 @@ function run () {
 		return json;
 	}
 	for (var boneName in bones) {
-		if (cancel) return;
 		if (!bones.hasOwnProperty(boneName)) continue;
 		var bone = bones[boneName];
 		if (!bone.parent) json += outputBone(bone);
@@ -246,10 +217,8 @@ function run () {
 	// Output slots.
 	var slotIndex = 0;
 	for (var slotName in slots) {
-		if (cancel) return;
 		if (!slots.hasOwnProperty(slotName)) continue;
 		var slot = slots[slotName];
-		slotName = stripName(slotName);
 		json += '\t{ "name": ' + quote(slotName) + ', "bone": ' + quote(slot.bone ? slot.bone.name : "root");
 		if (slot.attachment) json += ', "attachment": ' + quote(slot.attachment);
 		if (slot.blend) json += ', "blend": ' + quote(slot.blend);
@@ -263,25 +232,26 @@ function run () {
 	var skinIndex = 0, layerCount = 0;
 	for (var skinName in skins) {
 		if (!skins.hasOwnProperty(skinName)) continue;
-		var skinSlots = skins[skinName];
-		skinName = stripName(skinName);
 		json += '\t"' + skinName + '": {\n';
 
+		var skinSlots = skins[skinName];
 		var skinSlotIndex = 0, skinSlotsCount = countAssocArray(skinSlots);
 		for (var slotName in skinSlots) {
 			if (!skinSlots.hasOwnProperty(slotName)) continue;
 			var bone = slots[slotName].bone;
-			var skinLayers = skinSlots[slotName];
-			slotName = stripName(slotName);
 
 			json += '\t\t' + quote(slotName) + ': {\n';
 
+			var skinLayers = skinSlots[slotName];
 			var skinLayerIndex = 0, skinLayersCount = skinLayers.length;
 			for (var i = skinLayersCount - 1; i >= 0; i--) {
 				var layer = skinLayers[i];
 				layer.visible = true;
 
-				if (cancel) return;
+				if (cancel) {
+					activeDocument.close(SaveOptions.DONOTSAVECHANGES);
+					return;
+				}
 				setProgress(++layerCount / totalLayerCount, trim(layer.name));
 
 				var placeholderName = layer.attachmentName;
@@ -310,7 +280,7 @@ function run () {
 					if (settings.scale != 1) scaleImage();
 					if (settings.padding > 0) activeDocument.resizeCanvas(width, height, AnchorPosition.MIDDLECENTER);
 
-					var file = new File(imagesDir + attachmentName + ".png");
+					var file = new File(imagesDir + attachmentName + '.png');
 					file.parent.create();
 					savePNG(file);
 				}
@@ -342,13 +312,55 @@ function run () {
 
 		json += "\t\}" + (++skinIndex <= skinsCount ? ",\n" : "\n");
 	}
-	json += '},\n"animations": { "animation": {} }\n}';
+
+
+	if(settings.imageSequence && gotAnims ) {
+		// Proper hack but all I could figure out in such a short space of time
+        json += '},\n';
+        json += '"animations": {\n';
+        for (var slotName in slots) {
+            var slot = slots[slotName];
+            if (slot.childrenCount <= 1) continue;
+			var time = 0;
+			time = +time.toFixed(4);
+			json += '\t"animation": {\n';
+			json += '\t\t"slots": {\n';
+			json += '\t\t\t' + quote(slotName) + ': {\n';
+			json += '\t\t\t\t"attachment": [\n';
+			var animIndex = 0;
+			if (!slots.hasOwnProperty(slotName)) continue;
+
+			for (var i = 0; i < slot.childrenCount; i++) {
+				// Must be three digits in Photoshop _001, _002 etc
+				var formatNumber = ("00" + (i+1)).slice(-3);
+				slotA = slot.attachment;
+				slotA = slotA.substring(0, slotA.indexOf('_'));
+				slotA = slotA + "_" + formatNumber;
+				json += '\t\t\t\t\t{ "time": ' + time + ', "name": ' + quote(slotA) + ' }';
+				animIndex++;
+				time += 0.0333;
+				json += animIndex < slot.childrenCount ? ",\n" : "\n";
+
+			}
+		}
+
+
+
+		json += '\t\t\t\t]\n';
+		json += '\t\t\t}\n';
+		json += '\t\t}\n';
+		json += '\t}\n';
+		json += '}\n';
+		json += '}';
+
+	} else {
+		json += '},\n"animations": { "animation": {} }\n}';
+	}
 
 	activeDocument.close(SaveOptions.DONOTSAVECHANGES);
 
 	// Output JSON file.
 	if (settings.writeJson && settings.jsonPath) {
-		if (cancel) return;
 		jsonFile.encoding = "UTF-8";
 		jsonFile.remove();
 		jsonFile.open("w", "TEXT");
@@ -366,16 +378,16 @@ function showSettingsDialog () {
 		return;
 	}
 	if (!originalDoc) {
-		alert("Please open a document before running the PhotoshopToSpine script.");
+		alert("Please open a document before running the P2S Export with Image Sequence script.", "No Document Open");
 		return;
 	}
 	if (!hasFilePath()) {
-		alert("Please save the document before running the PhotoshopToSpine script.");
+		alert("Please save the document before running the P2S Export with Image Sequence script.", "Not saved");
 		return;
 	}
 
 	// Layout.
-	var dialog = new Window("dialog", "PhotoshopToSpine v" + scriptVersion), group;
+	var dialog = new Window("dialog", "P2S Export with Image Sequence " + scriptVersion), group;
 	dialog.alignChildren = "fill";
 
 	try {
@@ -405,6 +417,9 @@ function showSettingsDialog () {
 				writeJsonCheckbox.value = settings.writeJson;
 				var writeTemplateCheckbox = group.add("checkbox", undefined, " Write template image");
 				writeTemplateCheckbox.value = settings.writeTemplate;
+				var imageSequenceCheckbox = group.add("checkbox", undefined, " Export as Sequence");
+				imageSequenceCheckbox.value = settings.imageSequence;
+
 		var scaleText, paddingText, scaleSlider, paddingSlider;
 		if (!cs2) {
 			var slidersGroup = settingsGroup.add("group");
@@ -485,12 +500,18 @@ function showSettingsDialog () {
 	writeTemplateCheckbox.helpTip = "When checked, a PNG is written for the currently visible layers.";
 	writeJsonCheckbox.helpTip = "When checked, a Spine JSON file is written.";
 	trimWhitespaceCheckbox.helpTip = "When checked, blank pixels aroind the edges of each image are removed.";
+	imageSequenceCheckbox.helpTip = "When checked, Photoshop will export a file with each layer as an animation frame in Spine.";
 	scaleSlider.helpTip = "Scales the PNG files. Useful when using higher resolution art in Photoshop than in Spine.";
 	paddingSlider.helpTip = "Blank pixels around the edge of each image. Can avoid aliasing artifacts for opaque pixels along the image edge.";
 	imagesDirText.helpTip = "The folder to write PNGs. Begin with \"./\" to be relative to the PSD file. Blank to disable writing PNGs.";
 	jsonPathText.helpTip = "Output JSON file if ending with \".json\", else the folder to write the JSON file. Begin with \"./\" to be relative to the PSD file. Blank to disable writing a JSON file.";
 
 	// Events.
+	imageSequenceCheckbox.onClick = function () {
+		writeTemplateCheckbox.value = false;
+		ignoreBackgroundCheckbox.value = false;
+		writeJsonCheckbox.value = true;
+	}
 	scaleText.onChanging = function () { scaleSlider.value = scaleText.text; };
 	scaleSlider.onChanging = function () { scaleText.text = Math.round(scaleSlider.value); };
 	paddingText.onChanging = function () { paddingSlider.value = paddingText.text; };
@@ -528,6 +549,7 @@ function showSettingsDialog () {
 		settings.writeTemplate = writeTemplateCheckbox.value;
 		settings.writeJson = writeJsonCheckbox.value;
 		settings.trimWhitespace = trimWhitespaceCheckbox.value;
+		settings.imageSequence = imageSequenceCheckbox.value;
 
 		var scaleValue = parseFloat(scaleText.text);
 		if (scaleValue > 0 && scaleValue <= 100) settings.scale = scaleValue / 100;
@@ -557,6 +579,7 @@ function showSettingsDialog () {
 		writeTemplateCheckbox.enabled = false;
 		writeJsonCheckbox.enabled = false;
 		trimWhitespaceCheckbox.enabled = false;
+		imageSequenceCheckbox.enabled = false;
 		scaleText.enabled = false;
 		scaleSlider.enabled = false;
 		paddingText.enabled = false;
@@ -574,7 +597,7 @@ function showSettingsDialog () {
 			run();
 			// alert(new Date().getTime() - start);
 		} catch (e) {
-			alert("An unexpected error has occurred.\n\nTo debug, run the PhotoshopToSpine script using Adobe ExtendScript "
+			alert("An unexpected error has occurred.\n\nTo debug, run the SpineImageSequence script using Adobe ExtendScript "
 				+ "with \"Debug > Do not break on guarded exceptions\" unchecked.");
 			debugger;
 		} finally {
@@ -629,13 +652,15 @@ function getOptionType (value) {
 // Help dialog.
 
 function showHelpDialog () {
-	var dialog = new Window("dialog", "PhotoshopToSpine - Help");
+	var dialog = new Window("dialog", "SpineImageSequence - Help");
 	dialog.alignChildren = ["fill", ""];
 	dialog.orientation = "column";
 	dialog.alignment = ["", "top"];
 
 	var helpText = dialog.add("statictext", undefined, ""
 		+ "This script writes layers as images and creates a JSON file to bring the images into Spine in the same positions and draw order as they had in Photoshop.\n"
+		+ "\n"
+		+ "The updated version of this script allows the export of image sequences directly into Spine if the Export JSON and the Export as Sequence boxes are checked.\n"
 		+ "\n"
 		+ "The ruler origin corresponds to 0,0 in Spine.\n"
 		+ "\n"
@@ -668,7 +693,7 @@ function showHelpDialog () {
 // Progress dialog:
 
 function showProgressDialog () {
-	var dialog = new Window("palette", "PhotoshopToSpine - Processing...");
+	var dialog = new Window("palette", "SpineImageSequence - Processing...");
 	dialog.alignChildren = "fill";
 	dialog.orientation = "column";
 
@@ -703,7 +728,7 @@ function setProgress (percent, layerName) {
 	if (!progress.dialog.active) progress.dialog.active = true;
 }
 
-// PhotoshopToSpine utility:
+// SpineImageSequence utility:
 
 function unlock (layer) {
 	if (layer.allLocked) layer.allLocked = false;
@@ -719,7 +744,6 @@ function deleteLayer (layer) {
 }
 
 function collectLayers (parent, collect) {
-	outer:
 	for (var i = parent.layers.length - 1; i >= 0; i--) {
 		if (cancel) return;
 		var layer = parent.layers[i];
@@ -754,8 +778,9 @@ function collectLayers (parent, collect) {
 						message += "\n\nThe [" + tag + "] tag is only valid for layers, not for groups.";
 					else
 						message += "\n\nThe [" + tag + "] tag is not a valid tag.";
-					error(message);
-					continue outer;
+					alert(message);
+					cancel = true;
+					return;
 				}
 			} else if (!isValidLayerTag(tag)) {
 				var message = "Invalid layer name:\n\n" + layer.name;
@@ -763,15 +788,17 @@ function collectLayers (parent, collect) {
 					message += "\n\nThe [" + tag + "] tag is only valid for groups, not for layers.";
 				else
 					message += "\n\nThe [" + tag + "] tag is not a valid tag.";
-				error(message);
-				continue outer;
+				alert(message);
+				cancel = true;
+				return;
 			}
 		}
 
 		// Ensure only one tag.
 		if (layer.name.replace(/\[[^\]]+\]/, "").search(/\[[^\]]+\]/) != -1) {
-			error("A " + (group ? "group" : "layer") + " name must not have more than one tag:\n" + layer.name);
-			continue outer;
+			alert("A " + (group ? "group" : "layer") + " name must not have more than one tag:\n" + layer.name);
+			cancel = true;
+			return;
 		}
 
 		var changeVisibility = layer.kind == LayerKind.NORMAL || group;
@@ -855,23 +882,12 @@ function findTag (layer, tag, otherwise) {
 	return found ? stripTags(found.name) : otherwise;
 }
 
-function getParentBone (boneLayer, bones) {
-	var parentName = findTag(boneLayer.parent, "bone", "root");
-	var parent = get(bones, parentName);
-	if (!parent) { // Parent bone group with no attachment layers.
-		var parentParent = getParentBone(boneLayer.parent, bones);
-		set(bones, parentName, parent = { name: parentName, parent: parentParent, children: [], x: 0, y: 0 });
-		parentParent.children.push(parent);
-	}
-	return parent;
-}
-
 function jsonPath (jsonPath) {
 	if (endsWith(jsonPath, ".json")) {
-		var index = jsonPath.replace(/\\/g, "/").lastIndexOf("/");
+		var index = jsonPath.replace("\\", "/").lastIndexOf("/");
 		if (index != -1) return absolutePath(jsonPath.slice(0, index + 1)) + jsonPath.slice(index + 1);
 		return absolutePath("./") + jsonPath;
-	} 
+	}
 	var name = decodeURI(originalDoc.name);
 	return absolutePath(jsonPath) + name.substring(0, name.indexOf(".")) + ".json";
 }
@@ -881,21 +897,7 @@ function folders (layer, path) {
 	return folderLayer ? folders(folderLayer.parent, stripTags(folderLayer.name) + "/" + path) : path;
 }
 
-function error (message) {
-	errors.push(message);
-}
-
 // Photoshop utility:
-
-function get (object, name) {
-	return object["_" + name];
-}
-function set (object, name, value) {
-	object["_" + name] = value;
-}
-function stripName (name) {
-	return name.substring(1);
-}
 
 function scaleImage () {
 	var imageSize = activeDocument.width.as("px") * settings.scale;
@@ -976,9 +978,18 @@ function convertToRGB () {
 }
 
 function savePNG (file) {
-	var options = new PNGSaveOptions();
-	options.compression = 6;
-	activeDocument.saveAs(file, options, true, Extension.LOWERCASE);
+	options = new ExportOptionsSaveForWeb();
+    options.format = SaveDocumentType.PNG;
+    options.dither = Dither.NONE;
+    options.quality = 100;
+    options.PNG8 = false;
+    options.colors = 256;
+    options.transparency = true;
+    options.palette = Palette.LOCALADAPTIVE;
+    activeDocument.exportDocument(file, ExportType.SAVEFORWEB, options);
+ 	//var options = new PNGSaveOptions();
+	//options.compression = 9;
+	//activeDocument.saveAs(file, options, true, Extension.LOWERCASE);
 }
 
 // JavaScript utility:
@@ -1003,5 +1014,20 @@ function endsWith (str, suffix) {
 }
 
 function quote (value) {
-	return '"' + value.replace(/"/g, '\\"') + '"';
+	return '"' + value.replace('"', '\\"') + '"';
 }
+
+function getLayers(layer){
+
+    for(var i=0;i<layer.layers.length;i++){
+        doc.activeLayer = layer.layers[i];
+        if(doc.activeLayer.typename == 'LayerSet'){
+            if(doc.activeLayer.layers.length>0){
+                getLayers (doc.activeLayer)
+                }
+            }
+        else{
+            layerList.push(doc.activeLayer)
+            }
+        }
+    }
